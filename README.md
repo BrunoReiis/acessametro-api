@@ -65,7 +65,7 @@ A API ficará disponível em `http://localhost:3333` (ou na porta definida por
 | Comando | O que faz |
 | --- | --- |
 | `npm run dev` | Inicia o servidor com reinicialização durante o desenvolvimento. |
-| `npm run build` | Compila os arquivos TypeScript para `dist/`. |
+| `npm run build` | Gera o Prisma Client e compila TypeScript para `dist/`. |
 | `npm start` | Inicia a versão compilada. Execute `npm run build` antes. |
 | `npm run prisma:generate` | Gera o Prisma Client a partir do schema. |
 | `npm run prisma:migrate` | Executa `prisma migrate dev` para desenvolvimento. |
