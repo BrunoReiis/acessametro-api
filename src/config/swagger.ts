@@ -9,8 +9,8 @@ const swaggerDefinition = {
   },
   servers: [
     {
-      url: `http://localhost:${process.env.PORT ?? 3333}`,
-      description: 'Servidor local',
+      url: '/',
+      description: 'Mesmo domínio da documentação',
     },
   ],
   tags: [
