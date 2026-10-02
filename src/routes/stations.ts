@@ -33,6 +33,10 @@ const createStationSchema = z.object({
   accessibility: z.string().max(500).optional(),
 });
 
+const importStationsSchema = z.object({
+  stations: z.array(createStationSchema).min(1),
+});
+
 router.get('/', async (req, res, next) => {
   try {
     const query = stationQuerySchema.parse(req.query);
@@ -94,6 +98,54 @@ router.post('/', async (req, res, next) => {
     });
 
     return res.status(201).json({ success: true, data: station });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * @openapi
+ * /api/stations/import:
+ *   post:
+ *     summary: Importa várias estações
+ *     tags: [Stations]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [stations]
+ *             properties:
+ *               stations:
+ *                 type: array
+ *                 minItems: 1
+ *                 items:
+ *                   type: object
+ *                   required: [name]
+ *                   properties:
+ *                     name:
+ *                       type: string
+ *                     line:
+ *                       type: string
+ *                     zone:
+ *                       type: string
+ *                     latitude:
+ *                       type: number
+ *                     longitude:
+ *                       type: number
+ *                     accessibility:
+ *                       type: string
+ *     responses:
+ *       201:
+ *         description: Estações importadas
+ */
+router.post('/import', async (req, res, next) => {
+  try {
+    const { stations } = importStationsSchema.parse(req.body);
+    const result = await prisma.station.createMany({ data: stations });
+
+    return res.status(201).json({ success: true, data: { count: result.count } });
   } catch (error) {
     return next(error);
   }
