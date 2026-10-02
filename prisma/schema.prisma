@@ -1,0 +1,85 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum IncidentCategory {
+  ELEVATOR
+  ESCALATOR
+  ACCESSIBILITY
+  SAFETY
+  OTHER
+}
+
+enum IncidentStatus {
+  PENDING
+  IN_PROGRESS
+  RESOLVED
+  REJECTED
+}
+
+model User {
+  id           String    @id @default(cuid())
+  name         String
+  email        String    @unique
+  passwordHash String
+  role         Role      @default(USER)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  incidents    Incident[]
+  reviews      Review[]
+}
+
+model Station {
+  id               String    @id @default(cuid())
+  name             String
+  line             String?
+  zone             String?
+  latitude         Float?
+  longitude        Float?
+  accessibility    String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  incidents        Incident[]
+  reviews          Review[]
+}
+
+model Incident {
+  id          String          @id @default(cuid())
+  title       String
+  description String
+  category    IncidentCategory
+  status      IncidentStatus  @default(PENDING)
+  reporterName String?
+  stationId   String
+  station     Station         @relation(fields: [stationId], references: [id])
+  userId      String?
+  user        User?           @relation(fields: [userId], references: [id])
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+}
+
+model Review {
+  id          String   @id @default(cuid())
+  rating      Int
+  comment     String?
+  tags        String[]
+  stationId   String
+  station     Station  @relation(fields: [stationId], references: [id])
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id])
+  authorName  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([stationId])
+}
