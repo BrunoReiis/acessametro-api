@@ -30,6 +30,7 @@ type PhotonFeature = {
 };
 
 const applyChanges = process.argv.includes('--apply');
+const allowRemoteDatabase = process.argv.includes('--allow-remote');
 const refreshCache = process.argv.includes('--refresh');
 const sourceUrl = (process.env.STATIONS_SOURCE_API ?? 'https://acessametro-api.vercel.app/api')
   .replace(/\/+$/, '');
@@ -164,74 +165,75 @@ async function fetchSourceStations(): Promise<StationRecord[]> {
   return payload.data;
 }
 
-async function mergeIntoLocalDatabase(
+async function mergeIntoDatabase(
   stations: StationRecord[],
   coordinatesByName: Record<string, Coordinates | null>,
 ): Promise<{ created: number; updated: number; deduplicated: number }> {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error('DATABASE_URL não está configurada.');
   const databaseHost = new URL(databaseUrl).hostname.replace(/^\[|\]$/g, '');
-  if (!['localhost', '127.0.0.1', '::1'].includes(databaseHost)) {
-    throw new Error('Por segurança, --apply só grava em PostgreSQL local.');
+  if (!['localhost', '127.0.0.1', '::1'].includes(databaseHost) && !allowRemoteDatabase) {
+    throw new Error('DATABASE_URL é remoto; passe --allow-remote após confirmar a operação.');
   }
   if (!prisma) throw new Error('Cliente Prisma não inicializado.');
 
   const uniqueStations = new Map<string, StationRecord>();
   for (const station of stations) uniqueStations.set(stationIdentity(station), station);
 
-  return prisma.$transaction(async (transaction) => {
-    const existingStations = await transaction.station.findMany({ orderBy: { createdAt: 'asc' } });
-    const groups = new Map<string, typeof existingStations>();
-    for (const station of existingStations) {
-      const key = stationIdentity(station);
-      groups.set(key, [...(groups.get(key) ?? []), station]);
-    }
+  const existingStations = await prisma.station.findMany({ orderBy: { createdAt: 'asc' } });
+  const groups = new Map<string, typeof existingStations>();
+  for (const station of existingStations) {
+    const key = stationIdentity(station);
+    groups.set(key, [...(groups.get(key) ?? []), station]);
+  }
 
-    let deduplicated = 0;
-    for (const [key, matches] of groups) {
-      if (matches.length < 2) continue;
-      const [primary, ...duplicates] = matches;
-      for (const duplicate of duplicates) {
+  let deduplicated = 0;
+  for (const [key, matches] of groups) {
+    if (matches.length < 2) continue;
+    const [primary, ...duplicates] = matches;
+    for (const duplicate of duplicates) {
+      await prisma.$transaction(async (transaction) => {
         await transaction.incident.updateMany({ where: { stationId: duplicate.id }, data: { stationId: primary.id } });
         await transaction.review.updateMany({ where: { stationId: duplicate.id }, data: { stationId: primary.id } });
         await transaction.station.delete({ where: { id: duplicate.id } });
-        deduplicated += 1;
-      }
-      groups.set(key, [primary]);
+      });
+      deduplicated += 1;
     }
+    groups.set(key, [primary]);
+  }
 
-    let created = 0;
-    let updated = 0;
-    for (const station of uniqueStations.values()) {
-      const key = stationIdentity(station);
-      const existing = groups.get(key)?.[0];
-      const cachedCoordinates = coordinatesByName[normalizeStationName(station.name)];
-      const sourceCoordinates = station.latitude != null && station.longitude != null
-        ? { latitude: station.latitude, longitude: station.longitude }
-        : null;
-      const coordinates = validCoordinates(sourceCoordinates) ? sourceCoordinates : cachedCoordinates;
-      const accessibility = isPlaceholder(station.accessibility) ? undefined : station.accessibility;
-      const sharedData = {
-        name: station.name.trim(),
-        line: station.line?.trim() || null,
-        zone: station.zone?.trim() || null,
-        ...(accessibility !== undefined ? { accessibility } : {}),
-        ...(validCoordinates(coordinates) ? coordinates : {}),
-      };
+  let created = 0;
+  let updated = 0;
+  for (const station of uniqueStations.values()) {
+    const key = stationIdentity(station);
+    const existing = groups.get(key)?.[0];
+    const cachedCoordinates = coordinatesByName[normalizeStationName(station.name)];
+    const sourceCoordinates = station.latitude != null && station.longitude != null
+      ? { latitude: station.latitude, longitude: station.longitude }
+      : null;
+    const coordinates = validCoordinates(sourceCoordinates) ? sourceCoordinates : cachedCoordinates;
+    const accessibility = isPlaceholder(station.accessibility) ? undefined : station.accessibility;
+    const sharedData = {
+      name: station.name.trim(),
+      line: station.line?.trim() || null,
+      zone: station.zone?.trim() || null,
+      ...(accessibility !== undefined ? { accessibility } : {}),
+      ...(validCoordinates(coordinates) ? coordinates : {}),
+    };
 
-      if (existing) {
-        await transaction.station.update({ where: { id: existing.id }, data: sharedData });
-        updated += 1;
-      } else {
-        await transaction.station.create({
-          data: { ...sharedData, accessibility: accessibility ?? null },
-        });
-        created += 1;
-      }
+    if (existing) {
+      await prisma.station.update({ where: { id: existing.id }, data: sharedData });
+      updated += 1;
+    } else {
+      const createdStation = await prisma.station.create({
+        data: { ...sharedData, accessibility: accessibility ?? null },
+      });
+      groups.set(key, [createdStation]);
+      created += 1;
     }
+  }
 
-    return { created, updated, deduplicated };
-  });
+  return { created, updated, deduplicated };
 }
 
 async function main(): Promise<void> {
@@ -239,8 +241,11 @@ async function main(): Promise<void> {
     const databaseUrl = process.env.DATABASE_URL;
     if (!databaseUrl) throw new Error('DATABASE_URL não está configurada.');
     const host = new URL(databaseUrl).hostname.replace(/^\[|\]$/g, '');
+    if (!['localhost', '127.0.0.1', '::1'].includes(host) && !allowRemoteDatabase) {
+      throw new Error('--apply está restrito a banco local; passe --allow-remote para produção.');
+    }
     if (!['localhost', '127.0.0.1', '::1'].includes(host)) {
-      throw new Error('--apply está restrito a banco local; o .env atual aponta para remoto.');
+      console.warn('Atenção: aplicando atualização idempotente ao banco remoto autorizado.');
     }
   }
 
@@ -281,7 +286,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const result = await mergeIntoLocalDatabase(sourceStations, coordinatesByName);
+  const result = await mergeIntoDatabase(sourceStations, coordinatesByName);
   console.log(JSON.stringify({ ...result, unresolvedNames: unresolvedNames.length }));
 }
 
