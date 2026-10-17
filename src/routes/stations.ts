@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 
 import { prisma } from '../lib/prisma';
+import { requireAdmin, requireAuth } from '../middleware/auth';
 
 const router = Router();
 
@@ -25,12 +26,31 @@ const stationQuerySchema = z.object({
 });
 
 const createStationSchema = z.object({
-  name: z.string().min(2).max(150),
-  line: z.string().min(1).max(80).optional(),
-  zone: z.string().min(1).max(50).optional(),
-  latitude: z.number().optional(),
-  longitude: z.number().optional(),
-  accessibility: z.string().max(500).optional(),
+  name: z.string().trim().min(2).max(150),
+  line: z.string().trim().min(1).max(80).optional(),
+  zone: z.string().trim().min(1).max(50).optional(),
+  latitude: z.number().finite().min(-90).max(90).optional(),
+  longitude: z.number().finite().min(-180).max(180).optional(),
+  accessibility: z.string().trim().max(500).nullable().optional(),
+}).superRefine((station, context) => {
+  const hasLatitude = station.latitude !== undefined;
+  const hasLongitude = station.longitude !== undefined;
+
+  if (hasLatitude !== hasLongitude) {
+    context.addIssue({
+      code: 'custom',
+      path: [hasLatitude ? 'longitude' : 'latitude'],
+      message: 'Latitude e longitude devem ser informadas juntas.',
+    });
+  }
+
+  if (station.latitude === 0 && station.longitude === 0) {
+    context.addIssue({
+      code: 'custom',
+      path: ['latitude'],
+      message: 'As coordenadas 0,0 não representam uma estação válida.',
+    });
+  }
 });
 
 const importStationsSchema = z.object({
@@ -107,8 +127,10 @@ router.post('/', async (req, res, next) => {
  * @openapi
  * /api/stations/import:
  *   post:
- *     summary: Importa várias estações
+ *     summary: Importa ou atualiza estações sem duplicar registros
  *     tags: [Stations]
+ *     security:
+ *       - bearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -140,16 +162,93 @@ router.post('/', async (req, res, next) => {
  *       201:
  *         description: Estações importadas
  */
-router.post('/import', async (req, res, next) => {
+router.post('/import', requireAuth, requireAdmin, async (req, res, next) => {
   try {
-    const { stations } = importStationsSchema.parse(req.body);
-    const result = await prisma.station.createMany({ data: stations });
+    const { stations: requestedStations } = importStationsSchema.parse(req.body);
+    const stationsByKey = new Map<string, z.infer<typeof createStationSchema>>();
 
-    return res.status(201).json({ success: true, data: { count: result.count } });
+    for (const station of requestedStations) {
+      const key = stationIdentity(station.name, station.line);
+      const accessibility = station.accessibility?.trim().toLowerCase() === 'consultar'
+        ? null
+        : station.accessibility;
+      stationsByKey.set(key, { ...stationsByKey.get(key), ...station, accessibility });
+    }
+
+    const result = await prisma.$transaction(async (transaction) => {
+      const existingStations = await transaction.station.findMany({
+        orderBy: { createdAt: 'asc' },
+      });
+      const groupedStations = new Map<string, typeof existingStations>();
+
+      for (const station of existingStations) {
+        const key = stationIdentity(station.name, station.line ?? undefined);
+        groupedStations.set(key, [...(groupedStations.get(key) ?? []), station]);
+      }
+
+      let created = 0;
+      let updated = 0;
+      let deduplicated = 0;
+
+      for (const station of stationsByKey.values()) {
+        const key = stationIdentity(station.name, station.line);
+        const matches = groupedStations.get(key) ?? [];
+        if (matches.length === 0) {
+          const createdStation = await transaction.station.create({ data: station });
+          groupedStations.set(key, [createdStation]);
+          created += 1;
+          continue;
+        }
+
+        const [primary, ...duplicates] = matches;
+        for (const duplicate of duplicates) {
+          await transaction.incident.updateMany({
+            where: { stationId: duplicate.id },
+            data: { stationId: primary.id },
+          });
+          await transaction.review.updateMany({
+            where: { stationId: duplicate.id },
+            data: { stationId: primary.id },
+          });
+          await transaction.station.delete({ where: { id: duplicate.id } });
+          deduplicated += 1;
+        }
+
+        const updatedStation = await transaction.station.update({
+          where: { id: primary.id },
+          data: station,
+        });
+        groupedStations.set(key, [updatedStation]);
+        updated += 1;
+      }
+
+      return { created, updated, deduplicated };
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: { count: stationsByKey.size, ...result },
+    });
   } catch (error) {
     return next(error);
   }
 });
+
+function stationIdentity(name: string, line?: string): string {
+  const normalize = (value: string) =>
+    value
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .toLocaleLowerCase('pt-BR');
+
+  const normalizedName = normalize(name).replace(/^estacao\s+/, '');
+  const normalizedLine = normalize(line ?? '')
+    .replace(/^linha\s*/, '')
+    .replace(/[^a-z0-9]/g, '');
+  return `${normalizedName}|${normalizedLine}`;
+}
 
 router.get('/:id', async (req, res, next) => {
   try {
